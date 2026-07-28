@@ -7,7 +7,7 @@
 1. 解析 WhatsApp 匯出文字檔
 2. 只保留「一天大人」的文字訊息（完整保留，不做內容篩選）
 3. 依原文完全相同進行去重（保留時間最早的一則）
-4. 依日期產出 Markdown 檔案（TX-YYYYMMDDHHMMSS 格式）
+4. 依日期產出／合併 Markdown 檔案（TX-YYYYMMDDHHMMSS 格式）
 5. 產出去重報告
 
 使用方式：
@@ -96,6 +96,24 @@ def load_existing_texts(output_dir: Path) -> set:
     return existing
 
 
+def parse_existing_file(md_path: Path):
+    """讀取既有日檔，回傳 (header_prefix, list of message blocks sorted by TX time)"""
+    if not md_path.exists():
+        return None, []
+    text = md_path.read_text(encoding="utf-8")
+    parts = re.split(r"\n---\n\n?", text)
+    header = parts[0].strip() if parts else ""
+    blocks = []
+    for part in parts[1:]:
+        part = part.strip()
+        if not part:
+            continue
+        m = re.search(r"## (TX-(\d{14}))", part)
+        if m:
+            blocks.append((m.group(2), part))
+    return header, blocks
+
+
 def format_message(msg: dict, source_file: str) -> str:
     dt = msg["datetime"]
     tx_id = f"TX-{dt.strftime('%Y%m%d%H%M%S')}"
@@ -109,8 +127,7 @@ def format_message(msg: dict, source_file: str) -> str:
 {msg['content']}
 
 出處：WhatsApp 一天大人 ↔ 一天行  
-原始檔案：{source_file}
-"""
+原始檔案：{source_file}"""
 
 
 def process_file(input_path: str, output_dir: str, source_name: str = None):
@@ -174,20 +191,36 @@ def process_file(input_path: str, output_dir: str, source_name: str = None):
         new_count += 1
 
     for date_key in sorted(by_date.keys()):
-        msgs = by_date[date_key]
+        new_msgs = by_date[date_key]
         out_file = output_dir / f"{date_key}.md"
-        header = f"""# {date_key} 一天大人文字訊息
+
+        header, existing_blocks = parse_existing_file(out_file)
+        if header is None:
+            header = f"""# {date_key} 一天大人文字訊息
 
 來源：WhatsApp 一天大人 ↔ 一天行  
 原始檔案：{source_name}  
-整理原則：完整保留原文、一字不改、時間精確到秒（僅去重，不篩選內容）
+整理原則：完整保留原文、一字不改、時間精確到秒（僅去重，不篩選內容）"""
 
----
+        # 合併：既有 + 新增，依 TX 時間排序
+        all_blocks = list(existing_blocks)
+        for m in new_msgs:
+            block = format_message(m, source_name)
+            tx_key = m["datetime"].strftime("%Y%m%d%H%M%S")
+            all_blocks.append((tx_key, block))
 
-"""
-        body = "\n---\n\n".join(format_message(m, source_name) for m in msgs)
-        out_file.write_text(header + body, encoding="utf-8")
-        print(f"  寫入 {out_file.name}（{len(msgs)} 則）")
+        # 去重同一 TX-ID（理論上不應發生）
+        seen_tx = set()
+        unique_blocks = []
+        for tx_key, block in sorted(all_blocks, key=lambda x: x[0]):
+            if tx_key in seen_tx:
+                continue
+            seen_tx.add(tx_key)
+            unique_blocks.append(block)
+
+        body = "\n\n---\n\n".join(unique_blocks)
+        out_file.write_text(header + "\n\n---\n\n" + body + "\n", encoding="utf-8")
+        print(f"  寫入 {out_file.name}（既有 {len(existing_blocks)} + 新增 {len(new_msgs)} → 合計 {len(unique_blocks)} 則）")
 
     print("\n========== 去重報告 ==========")
     print(f"一天大人有效訊息總數：{len(dayiren_msgs)}")
