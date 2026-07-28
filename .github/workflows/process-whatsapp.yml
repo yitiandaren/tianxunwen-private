@@ -1,0 +1,87 @@
+name: Process WhatsApp Tianxunwen
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'raw/whatsapp/**'
+  workflow_dispatch:
+    inputs:
+      input_file:
+        description: 'Optional: specific raw file path (e.g. raw/whatsapp/xxx.txt). Leave empty to process all new/changed files in this push.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Detect files to process
+        id: detect
+        run: |
+          set -e
+          mkdir -p raw/whatsapp master/whatsapp
+
+          if [ -n "${{ github.event.inputs.input_file }}" ]; then
+            echo "files=${{ github.event.inputs.input_file }}" >> $GITHUB_OUTPUT
+            echo "Manual file: ${{ github.event.inputs.input_file }}"
+            exit 0
+          fi
+
+          # On push: process changed/added txt files under raw/whatsapp
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CHANGED=$(git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }} -- 'raw/whatsapp/*.txt' || true)
+            if [ -z "$CHANGED" ]; then
+              # fallback: all txt in raw/whatsapp (first run / empty before)
+              CHANGED=$(ls raw/whatsapp/*.txt 2>/dev/null || true)
+            fi
+          else
+            CHANGED=$(ls raw/whatsapp/*.txt 2>/dev/null || true)
+          fi
+
+          # Flatten to space-separated for output
+          FILES=$(echo "$CHANGED" | tr '\n' ' ' | xargs)
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+          echo "Files to process: $FILES"
+
+      - name: Run processing script
+        if: steps.detect.outputs.files != ''
+        run: |
+          set -e
+          for f in ${{ steps.detect.outputs.files }}; do
+            if [ -f "$f" ]; then
+              echo "========== Processing $f =========="
+              python3 scripts/process_whatsapp_tianxunwen.py "$f" --output-dir master/whatsapp --source-name "$(basename "$f")"
+            else
+              echo "Skip missing: $f"
+            fi
+          done
+
+      - name: Commit master updates
+        if: steps.detect.outputs.files != ''
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- master/whatsapp; then
+            echo "No changes in master/whatsapp"
+            exit 0
+          fi
+
+          git add master/whatsapp
+          git commit -m "auto: 整理 WhatsApp 天訊文（去重合併）"
+          git push
