@@ -1,0 +1,115 @@
+name: Batch Tianxunwen Pipeline
+
+on:
+  # 手動：可指定單檔或留空處理全部 raw/whatsapp/*.txt
+  workflow_dispatch:
+    inputs:
+      input_file:
+        description: '單檔路徑（例如 raw/whatsapp/20260401_0531_chat.txt）。留空=全部 txt'
+        required: false
+        default: ''
+      skip_master:
+        description: '只產出 classify 報告，不寫入 master（true/false）'
+        required: false
+        default: 'false'
+      only_process:
+        description: '只去重寫 master，不跑篩選報告（true/false）'
+        required: false
+        default: 'false'
+
+  # push 到 raw/whatsapp 時：只處理本次變更的 txt
+  push:
+    branches: [main]
+    paths:
+      - 'raw/whatsapp/**.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  batch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Detect files
+        id: detect
+        run: |
+          set -e
+          mkdir -p raw/whatsapp master/whatsapp classify
+
+          if [ -n "${{ github.event.inputs.input_file }}" ]; then
+            echo "files=${{ github.event.inputs.input_file }}" >> "$GITHUB_OUTPUT"
+            echo "Manual single: ${{ github.event.inputs.input_file }}"
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CHANGED=$(git diff --name-only --diff-filter=AM ${{ github.event.before }} ${{ github.sha }} -- 'raw/whatsapp/*.txt' 2>/dev/null || true)
+            if [ -z "$CHANGED" ]; then
+              CHANGED=$(ls raw/whatsapp/*.txt 2>/dev/null || true)
+            fi
+          else
+            # workflow_dispatch 且未指定單檔 → 全部
+            CHANGED=$(ls raw/whatsapp/*.txt 2>/dev/null || true)
+          fi
+
+          FILES=$(echo "$CHANGED" | tr '\n' ' ' | xargs)
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+          echo "Files: $FILES"
+
+      - name: Run batch pipeline
+        if: steps.detect.outputs.files != ''
+        env:
+          SKIP_MASTER: ${{ github.event.inputs.skip_master || 'false' }}
+          ONLY_PROCESS: ${{ github.event.inputs.only_process || 'false' }}
+        run: |
+          set -e
+          for f in ${{ steps.detect.outputs.files }}; do
+            if [ ! -f "$f" ]; then
+              echo "Skip missing: $f"
+              continue
+            fi
+            echo "========== $f =========="
+            if [ "$ONLY_PROCESS" = "true" ]; then
+              python3 scripts/process_whatsapp_tianxunwen.py "$f" \
+                --output-dir master/whatsapp \
+                --source-name "$(basename "$f")"
+            elif [ "$SKIP_MASTER" = "true" ]; then
+              python3 scripts/run_tianxunwen_pipeline.py "$f" --skip-master
+            else
+              # 完整：去重 + 篩選報告（若 run 腳本不存在則退回只去重）
+              if [ -f scripts/run_tianxunwen_pipeline.py ]; then
+                python3 scripts/run_tianxunwen_pipeline.py "$f"
+              else
+                python3 scripts/process_whatsapp_tianxunwen.py "$f" \
+                  --output-dir master/whatsapp \
+                  --source-name "$(basename "$f")"
+              fi
+            fi
+          done
+
+      - name: Commit results
+        if: steps.detect.outputs.files != ''
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add master/whatsapp classify 2>/dev/null || true
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "auto: 批量整理天訊文（master + classify）"
+          git push
